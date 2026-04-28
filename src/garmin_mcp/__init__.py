@@ -251,7 +251,7 @@ def main():
     port = os.environ.get("PORT")
     if port:
         import uvicorn
-        uvicorn.run(app.asgi_app, host="0.0.0.0", port=int(port))
+        uvicorn.run(app.sse_app, host="0.0.0.0", port=int(port))
     else:
         app.run()
 
