@@ -227,7 +227,7 @@ def main():
     nutrition.configure(garmin_client)
 
     # Create the MCP app
-    app = FastMCP("Garmin Connect v1.0")
+    app = FastMCP("Garmin Connect v1.0", host="0.0.0.0")
 
     # Register tools from all modules
     app = activity_management.register_tools(app)
