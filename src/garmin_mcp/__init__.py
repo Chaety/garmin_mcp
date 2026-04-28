@@ -249,8 +249,8 @@ def main():
     # Run the MCP server
     import os
     port = os.environ.get("PORT")
-    if port:
-        app.run(transport="sse", host="0.0.0.0", port=int(port))
+     if port:
+        app.run(transport="sse", port=int(port))
     else:
         app.run()
 
