@@ -11,7 +11,8 @@ ENV PYTHONUNBUFFERED=1 \
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
-RUN uv pip install -e .
+RUN uv pip install -e . && \
+    uv pip install "garminconnect @ git+https://github.com/cyberjunky/python-garminconnect@react"
 
 COPY tests/ ./tests/
 COPY pytest.ini ./
@@ -19,7 +20,7 @@ COPY pytest.ini ./
 RUN mkdir -p /root/.garminconnect && \
     chmod 700 /root/.garminconnect
 
-RUN printf '#!/bin/sh\nif [ -n "$GARMIN_TOKENS" ]; then\n    echo "$GARMIN_TOKENS" > /root/.garminconnect/garmin_tokens.json\nfi\nexec garmin-mcp "$@"\n' > /entrypoint.sh && \
+RUN printf '#!/bin/sh\nif [ -n "$GARMIN_TOKENS" ]; then\n    mkdir -p /root/.garminconnect\n    echo "$GARMIN_TOKENS" > /root/.garminconnect/garmin_tokens.json\nfi\nexec garmin-mcp "$@"\n' > /entrypoint.sh && \
     chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
