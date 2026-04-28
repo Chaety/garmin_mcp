@@ -250,7 +250,7 @@ def main():
     import os
     port = os.environ.get("PORT")
     if port:
-        app.run(transport="sse")
+        app.run(transport="sse", host="0.0.0.0", port=int(port))
     else:
         app.run()
 
