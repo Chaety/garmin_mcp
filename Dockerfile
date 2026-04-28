@@ -20,7 +20,7 @@ COPY pytest.ini ./
 RUN mkdir -p /root/.garminconnect && \
     chmod 700 /root/.garminconnect
 
-RUN printf '#!/bin/sh\nif [ -n "$GARMIN_TOKENS" ]; then\n    mkdir -p /root/.garminconnect\n    echo "$GARMIN_TOKENS" > /root/.garminconnect/garmin_tokens.json\nfi\nexec garmin-mcp "$@"\n' > /entrypoint.sh && \
+RUN printf '#!/bin/sh\nif [ -n "$GARMIN_TOKENS" ]; then\n    mkdir -p /root/.garminconnect\n    echo "$GARMIN_TOKENS" > /root/.garminconnect/garmin_tokens.json\nfi\nexec garmin-mcp --transport sse --port ${PORT:-8080} "$@"\n' > /entrypoint.sh && \
     chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
