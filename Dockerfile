@@ -8,14 +8,11 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_SYSTEM_PYTHON=1
 
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
 RUN uv pip install -e . && \
-    pip install requests readchar && \
-    pip install "git+https://github.com/cyberjunky/python-garminconnect.git#egg=garminconnect"
+    uv pip install garminconnect==0.3.2
 
 COPY tests/ ./tests/
 COPY pytest.ini ./
