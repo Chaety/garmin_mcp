@@ -12,7 +12,8 @@ COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
 RUN uv pip install -e . && \
-    uv pip install garminconnect==0.3.2
+    uv pip install garminconnect==0.3.2 && \
+    uv pip install "mcp>=1.23.0"
 
 COPY tests/ ./tests/
 COPY pytest.ini ./
