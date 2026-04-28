@@ -247,7 +247,12 @@ def main():
     app = workout_templates.register_resources(app)
 
     # Run the MCP server
-    app.run()
+    import os
+    port = os.environ.get("PORT")
+    if port:
+        app.run(transport="sse", host="0.0.0.0", port=int(port))
+    else:
+        app.run()
 
 
 if __name__ == "__main__":
