@@ -33,8 +33,8 @@ RUN mkdir -p /root/.garminconnect && \
     chmod 700 /root/.garminconnect
 
 # Write Garmin tokens from environment variable
-RUN if [ -n "$GARMIN_TOKENS" ]; then \
-    echo "$GARMIN_TOKENS" > /root/.garminconnect/garmin_tokens.json; \
+RUN if [ -n "${GARMIN_TOKENS}" ]; then \
+    echo "${GARMIN_TOKENS}" > /root/.garminconnect/garmin_tokens.json; \
     fi
 
 # Expose the application (if needed for network communication)
