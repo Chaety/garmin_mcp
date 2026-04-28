@@ -251,7 +251,12 @@ def main():
     port = os.environ.get("PORT")
     if port:
         import uvicorn
-        uvicorn.run(app.sse_app, host="0.0.0.0", port=int(port))
+        uvicorn.run(
+            app.sse_app,
+            host="0.0.0.0",
+            port=int(port),
+            headers=[("Access-Control-Allow-Origin", "*")]
+        )
     else:
         app.run()
 
