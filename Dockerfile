@@ -14,7 +14,7 @@ COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
 RUN uv pip install -e . && \
-    uv pip install "garminconnect @ git+https://github.com/cyberjunky/python-garminconnect@react"
+    uv pip install "garminconnect @ git+https://github.com/cyberjunky/python-garminconnect@refs/heads/react"
 
 COPY tests/ ./tests/
 COPY pytest.ini ./
