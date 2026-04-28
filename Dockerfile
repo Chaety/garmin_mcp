@@ -32,18 +32,12 @@ COPY pytest.ini ./
 RUN mkdir -p /root/.garminconnect && \
     chmod 700 /root/.garminconnect
 
-# Write Garmin tokens from environment variable
-RUN if [ -n "${GARMIN_TOKENS}" ]; then \
-    echo "${GARMIN_TOKENS}" > /root/.garminconnect/garmin_tokens.json; \
-    fi
+# Create entrypoint script
+RUN echo '#!/bin/sh\n\
+if [ -n "$GARMIN_TOKENS" ]; then\n\
+    echo "$GARMIN_TOKENS" > /root/.garminconnect/garmin_tokens.json\n\
+fi\n\
+exec garmin-mcp "$@"' > /entrypoint.sh && \
+    chmod +x /entrypoint.sh
 
-# Expose the application (if needed for network communication)
-# Note: MCP servers typically communicate via stdio, so no port exposure is usually needed
-# EXPOSE 8000
-
-# Set the entrypoint to run the MCP server
-ENTRYPOINT ["garmin-mcp"]
-
-# Health check (optional - adjust based on your needs)
-# HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-#   CMD python -c "import sys; sys.exit(0)"
+ENTRYPOINT ["/entrypoint.sh"]
