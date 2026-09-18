@@ -21,8 +21,10 @@ COPY pyproject.toml README.md ./
 # Copy the application source code (needed for editable install)
 COPY src/ ./src/
 
-# Install dependencies using uv
-RUN uv pip install -e .
+# Install dependencies using uv. The [gcs] extra is included because the
+# containerised path is the hosted path, where an ephemeral filesystem cannot
+# keep Garmin tokens across restarts; it is inert unless GARMIN_TOKENS_GCS is set.
+RUN uv pip install -e ".[gcs]"
 
 # Copy test files (optional, for testing in container)
 COPY tests/ ./tests/

@@ -595,13 +595,56 @@ The bind address defaults to `0.0.0.0` only when the platform injects `PORT`
 `127.0.0.1` instead, so a development machine does not expose an
 unauthenticated Garmin bridge to its network. Override with `GARMIN_MCP_HOST`.
 
+### Persisting tokens on an ephemeral filesystem
+
+A container's filesystem does not survive a restart, and a container cannot log
+in again on its own — a fresh Garmin login needs an MFA code typed at a
+terminal. Set `GARMIN_TOKENS_GCS` so every cold start restores the session from
+Cloud Storage instead:
+
+| Value | Layout |
+| --- | --- |
+| `gs://bucket/path/tokens.json` | One object holding `{"oauth1_token": {...}, "oauth2_token": {...}}`. A base64-encoded copy of that JSON also works. |
+| `gs://bucket/path/` | A prefix holding garth's `oauth1_token.json` and `oauth2_token.json` as written by `garth.Client.dump()`. |
+
+Tokens are downloaded into the token directory before login, and uploaded again
+after a fresh login writes new ones. A missing or malformed object is logged and
+skipped rather than raised, so the server still falls back to its normal login
+path and prints the usual authentication guidance.
+
+Requires the optional dependency (already included in the Docker image):
+
+```bash
+pip install 'garmin-mcp[gcs]'
+```
+
+Seed the bucket once from a machine where you can complete MFA:
+
+```bash
+garmin-mcp-auth                     # writes ~/.garminconnect
+python - <<'EOF'
+import json, pathlib
+d = pathlib.Path.home() / ".garminconnect"
+bundle = {
+    "oauth1_token": json.loads((d / "oauth1_token.json").read_text()),
+    "oauth2_token": json.loads((d / "oauth2_token.json").read_text()),
+}
+pathlib.Path("garmin_tokens.json").write_text(json.dumps(bundle, indent=4))
+EOF
+gcloud storage cp garmin_tokens.json gs://<bucket>/garmin_tokens.json
+rm garmin_tokens.json                # equivalent to your login credentials
+```
+
+The service account needs `storage.objects.get` on the bucket, plus
+`storage.objects.create` to upload refreshed tokens.
+
 ### Google Cloud Run
 
 ```bash
 gcloud run deploy garmin-mcp \
   --source . \
   --region <region> \
-  --set-env-vars GARMIN_MCP_TRANSPORT=streamable-http \
+  --set-env-vars GARMIN_MCP_TRANSPORT=streamable-http,GARMIN_TOKENS_GCS=gs://<bucket>/garmin_tokens.json \
   --cpu 0.5 --memory 512Mi \
   --min-instances 0
 ```

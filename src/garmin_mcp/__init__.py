@@ -28,6 +28,7 @@ from garmin_mcp import nutrition
 from garmin_mcp import workout_builders
 from garmin_mcp import courses
 from garmin_mcp import activity_analysis
+from garmin_mcp import gcs_tokens
 
 
 def is_interactive_terminal() -> bool:
@@ -84,6 +85,11 @@ elif password_file:
 
 tokenstore = os.getenv("GARMINTOKENS") or "~/.garminconnect"
 tokenstore_base64 = os.getenv("GARMINTOKENS_BASE64") or "~/.garminconnect_base64"
+# Optional Cloud Storage backing for the token directory. A container's
+# filesystem does not survive a restart, and a fresh Garmin login needs an MFA
+# code typed at a terminal, so a hosted server has no way back once its tokens
+# are gone. See garmin_mcp.gcs_tokens for the accepted URI forms.
+tokens_gcs = os.getenv("GARMIN_TOKENS_GCS")
 is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
 
 
@@ -220,6 +226,10 @@ def init_api(email, password):
     """Initialize Garmin API with your credentials."""
     import io
 
+    # Pull the tokens down first so the directory login below can find them.
+    if tokens_gcs:
+        gcs_tokens.download_tokens(tokens_gcs, tokenstore)
+
     try:
         # Using Oauth1 and OAuth2 token files from directory
         print(
@@ -276,6 +286,8 @@ def init_api(email, password):
                 garmin.resume_login(result2, mfa_code)
             # Save Oauth1 and Oauth2 token files to directory for next login
             garmin.client.dump(tokenstore)
+            if tokens_gcs:
+                gcs_tokens.upload_tokens(tokens_gcs, tokenstore)
             print(
                 f"Oauth tokens stored in '{tokenstore}' directory for future use. (first method)\n",
                 file=sys.stderr,
