@@ -12,7 +12,8 @@ dependencies = [
     "python-dotenv==1.2.2",
     "garminconnect==0.3.2",
     "requests==2.33.0",
-    "mcp>=1.23.0",
+    # mcp 2.x renamed FastMCP to MCPServer; pin below it until this server migrates.
+    "mcp>=1.23.0,<2",
     "fitparse>=1.2.0",
 ]
 

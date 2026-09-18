@@ -561,6 +561,58 @@ docker volume rm garmin_mcp_garmin-tokens
 To use the Dockerized MCP server with Claude Desktop, you can configure it to communicate with the container. However, note that MCP servers typically communicate via stdio, which works best with direct process execution. For Docker-based deployments, consider using the standard `uvx` method shown in the [With Claude Desktop](#with-claude-desktop) section instead.
 
 
+## Remote deployment (HTTP transports)
+
+By default the server talks over **stdio**, which is what local clients such as
+Claude Desktop expect. To host it remotely, pick an HTTP transport with
+`GARMIN_MCP_TRANSPORT`.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GARMIN_MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, or `streamable-http` |
+| `GARMIN_MCP_HOST` | `0.0.0.0` when `PORT` is set, else `127.0.0.1` | Bind address |
+| `GARMIN_MCP_PORT` | `PORT`, else `8000` | Bind port |
+| `GARMIN_MCP_STATELESS` | `true` | streamable-http only: keep no per-client session |
+| `GARMIN_MCP_JSON_RESPONSE` | follows `GARMIN_MCP_STATELESS` | streamable-http only: plain JSON instead of an event stream |
+
+### Prefer `streamable-http` over `sse` when you pay per second
+
+SSE holds one request open for the entire client session. On platforms that
+bill per request-second — Google Cloud Run among them — you are charged for
+every second that request stays open, so an idle connection costs exactly as
+much as a busy one. A client left connected all day bills all day.
+
+Stateless `streamable-http` answers each tool call in its own short request and
+closes it, so nothing is billed between calls. Measured against this server:
+
+| Transport | Time the request stays open |
+| --- | --- |
+| `streamable-http` (stateless) | ~0.003 s per call |
+| `sse` | until the client disconnects or the platform timeout fires |
+
+The bind address defaults to `0.0.0.0` only when the platform injects `PORT`
+(the usual PaaS convention). Running an HTTP transport locally binds
+`127.0.0.1` instead, so a development machine does not expose an
+unauthenticated Garmin bridge to its network. Override with `GARMIN_MCP_HOST`.
+
+### Google Cloud Run
+
+```bash
+gcloud run deploy garmin-mcp \
+  --source . \
+  --region <region> \
+  --set-env-vars GARMIN_MCP_TRANSPORT=streamable-http \
+  --cpu 0.5 --memory 512Mi \
+  --min-instances 0
+```
+
+Cloud Run injects `PORT`, so host and port need no further configuration. Keep
+`--min-instances 0` so the service scales to zero when unused, and leave CPU
+throttling at its default so CPU is billed only while a request is in flight.
+
+The MCP endpoint is then `https://<service-url>/mcp` (`/sse` for the SSE
+transport).
+
 ## Usage Examples
 
 Once connected in Claude, you can ask questions like:
