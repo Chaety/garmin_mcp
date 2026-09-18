@@ -103,6 +103,72 @@ enabled_tools = _parse_tool_set(os.getenv("GARMIN_ENABLED_TOOLS"))
 disabled_tools = _parse_tool_set(os.getenv("GARMIN_DISABLED_TOOLS"))
 
 
+# Transport selection. ``stdio`` keeps the local uvx/Claude Desktop flow
+# unchanged and stays the default; the HTTP transports are opt-in for remote
+# deployments.
+#
+# Prefer ``streamable-http`` over ``sse`` when hosting on a serverless platform.
+# SSE holds one request open for the whole client session, and platforms that
+# bill per request-second (Cloud Run among them) charge for every second that
+# request stays open — an idle connection costs the same as a busy one.
+# Stateless streamable-http answers each tool call in its own short request, so
+# nothing is billed between calls.
+_VALID_TRANSPORTS = ("stdio", "sse", "streamable-http")
+
+
+def _env_flag(name, default):
+    """Read a boolean env var, falling back to ``default`` when unset."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def transport_settings():
+    """Resolve the transport name and FastMCP settings from the environment.
+
+    Returns:
+        tuple[str, dict]: transport name for ``app.run()`` and keyword settings
+        for the ``FastMCP`` constructor (empty for stdio).
+
+    Raises:
+        ValueError: if GARMIN_MCP_TRANSPORT names an unknown transport.
+    """
+    transport = (os.getenv("GARMIN_MCP_TRANSPORT") or "stdio").strip().lower()
+    if transport not in _VALID_TRANSPORTS:
+        raise ValueError(
+            "GARMIN_MCP_TRANSPORT must be one of "
+            f"{', '.join(_VALID_TRANSPORTS)}; got {transport!r}"
+        )
+
+    if transport == "stdio":
+        return transport, {}
+
+    # PaaS platforms (Cloud Run, Render, Heroku) inject PORT; an explicit
+    # GARMIN_MCP_PORT wins when both are set.
+    platform_port = os.getenv("PORT")
+    port = os.getenv("GARMIN_MCP_PORT") or platform_port or "8000"
+
+    # A container must bind every interface or its health check cannot reach it,
+    # while a laptop should not expose an unauthenticated Garmin bridge to the
+    # local network. Presence of PORT is the usual signal for the former.
+    default_host = "0.0.0.0" if platform_port else "127.0.0.1"
+
+    settings = {
+        "host": os.getenv("GARMIN_MCP_HOST") or default_host,
+        "port": int(port),
+    }
+
+    if transport == "streamable-http":
+        # Stateless keeps no per-client session, so no connection has to persist
+        # between tool calls; JSON responses then avoid opening a stream at all.
+        stateless = _env_flag("GARMIN_MCP_STATELESS", True)
+        settings["stateless_http"] = stateless
+        settings["json_response"] = _env_flag("GARMIN_MCP_JSON_RESPONSE", stateless)
+
+    return transport, settings
+
+
 class _ToolFilter:
     """Wraps a FastMCP app to conditionally register tools by function name.
 
@@ -303,8 +369,14 @@ def main():
     courses.configure(garmin_client)
     activity_analysis.configure(garmin_client)
 
+    # Resolve the transport before building the app: host/port and the
+    # stateless flag are constructor settings, not run() arguments.
+    transport, settings = transport_settings()
+
     # Create the MCP app, wrapped so the env-var filter can drop tools
-    app = _ToolFilter(FastMCP("Garmin Connect v1.0"), enabled_tools, disabled_tools)
+    app = _ToolFilter(
+        FastMCP("Garmin Connect v1.0", **settings), enabled_tools, disabled_tools
+    )
     if enabled_tools:
         print(f"Tool filter: allowlist of {len(enabled_tools)} tool(s).", file=sys.stderr)
     elif disabled_tools:
@@ -339,7 +411,19 @@ def main():
         )
 
     # Run the MCP server
-    app.run()
+    if transport == "stdio":
+        print("Transport: stdio", file=sys.stderr)
+    else:
+        print(
+            f"Transport: {transport} on {settings['host']}:{settings['port']}"
+            + (
+                f" (stateless={settings['stateless_http']})"
+                if transport == "streamable-http"
+                else ""
+            ),
+            file=sys.stderr,
+        )
+    app.run(transport=transport)
 
 
 if __name__ == "__main__":

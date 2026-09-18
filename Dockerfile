@@ -32,9 +32,9 @@ COPY pytest.ini ./
 RUN mkdir -p /root/.garminconnect && \
     chmod 700 /root/.garminconnect
 
-# Expose the application (if needed for network communication)
-# Note: MCP servers typically communicate via stdio, so no port exposure is usually needed
-# EXPOSE 8000
+# stdio needs no port. The HTTP transports do: set GARMIN_MCP_TRANSPORT to
+# streamable-http (preferred) or sse, and PORT or GARMIN_MCP_PORT to override.
+EXPOSE 8000
 
 # Set the entrypoint to run the MCP server
 ENTRYPOINT ["garmin-mcp"]
