@@ -12,6 +12,13 @@ build/
 # Virtual environments
 .env
 .venv/
+
+# Garmin OAuth tokens and deployment env files. These are live bearer
+# credentials; keeping them out of git also keeps them out of the Docker build
+# context, since .dockerignore is symlinked to this file.
+garmin_tokens.json
+.garminconnect_base64
+env.yaml
 *.log
 .DS_Store
 .claude.md

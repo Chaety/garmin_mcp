@@ -138,3 +138,81 @@ async def test_schedule_week_partial_idempotency(
     assert scheduled[1]["status"] == "scheduled"
     # Only the new one triggered the POST
     assert mock_garmin_client.client.post.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_create_run_workout_success(app_with_builders, mock_garmin_client):
+    """create_run_workout uploads the workout and returns the workout_id."""
+    mock_garmin_client.upload_workout.return_value = {
+        "workoutId": 9876543210,
+        "workoutName": "Step 8 - 30min continuous",
+    }
+
+    result = await app_with_builders.call_tool(
+        "create_run_workout",
+        {
+            "name": "Step 8 - 30min continuous",
+            "run_seconds": 1800,
+            "warmup_min": 5,
+            "cooldown_min": 5,
+            "hr_zone": "Z3",
+        },
+    )
+
+    assert result is not None
+    payload = json.loads(result[0][0].text)
+    assert payload["status"] == "success"
+    assert payload["workout_id"] == 9876543210
+    mock_garmin_client.upload_workout.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_create_run_workout_custom_hr_range(app_with_builders, mock_garmin_client):
+    """hr_min/hr_max on the tool call produce a custom bpm-range target, not a zoneNumber."""
+    mock_garmin_client.upload_workout.return_value = {
+        "workoutId": 1111111111,
+        "workoutName": "Base run - 7/20",
+    }
+
+    result = await app_with_builders.call_tool(
+        "create_run_workout",
+        {
+            "name": "Base run - 7/20",
+            "run_seconds": 1440,
+            "warmup_min": 5,
+            "cooldown_min": 5,
+            "hr_min": 136,
+            "hr_max": 148,
+        },
+    )
+
+    assert result is not None
+    payload = json.loads(result[0][0].text)
+    assert payload["status"] == "success"
+
+    uploaded_json = mock_garmin_client.upload_workout.call_args[0][0]
+    interval_step = uploaded_json["workoutSegments"][0]["workoutSteps"][1]
+    assert interval_step["targetType"]["workoutTargetTypeKey"] == "heart.rate.zone"
+    assert interval_step["targetValueOne"] == 136.0
+    assert interval_step["targetValueTwo"] == 148.0
+    assert "zoneNumber" not in interval_step
+
+
+@pytest.mark.asyncio
+async def test_create_run_workout_exception(app_with_builders, mock_garmin_client):
+    """create_run_workout returns an error string when the API raises an exception."""
+    mock_garmin_client.upload_workout.side_effect = Exception("Upload failed")
+
+    result = await app_with_builders.call_tool(
+        "create_run_workout",
+        {
+            "name": "Step 8 - 30min continuous",
+            "run_seconds": 1800,
+            "warmup_min": 5,
+            "cooldown_min": 5,
+        },
+    )
+
+    assert result is not None
+    assert "Error" in result[0][0].text
+    assert "Upload failed" in result[0][0].text
