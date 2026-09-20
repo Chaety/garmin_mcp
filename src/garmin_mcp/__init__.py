@@ -12,6 +12,8 @@ from mcp.server.fastmcp import FastMCP
 from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError
 
 # Import all modules
+from garmin_mcp import token_utils
+from garmin_mcp import gcs_token_store
 from garmin_mcp import activity_management
 from garmin_mcp import health_wellness
 from garmin_mcp import user_profile
@@ -28,7 +30,6 @@ from garmin_mcp import nutrition
 from garmin_mcp import workout_builders
 from garmin_mcp import courses
 from garmin_mcp import activity_analysis
-from garmin_mcp import gcs_tokens
 
 
 def is_interactive_terminal() -> bool:
@@ -62,6 +63,12 @@ def get_mfa() -> str:
     return input("Enter MFA code: ")
 
 
+def _normalize_optional_user_config(value: str | None, key: str) -> str | None:
+    """Treat an unresolved optional Desktop Extension value as unset."""
+    unresolved_placeholder = f"${{user_config.{key}}}"
+    return None if value == unresolved_placeholder else value
+
+
 # Get credentials from environment
 email = os.environ.get("GARMIN_EMAIL")
 email_file = os.environ.get("GARMIN_EMAIL_FILE")
@@ -83,14 +90,29 @@ elif password_file:
     with open(password_file, "r") as password_file:
         password = password_file.read().rstrip()
 
-tokenstore = os.getenv("GARMINTOKENS") or "~/.garminconnect"
-tokenstore_base64 = os.getenv("GARMINTOKENS_BASE64") or "~/.garminconnect_base64"
-# Optional Cloud Storage backing for the token directory. A container's
-# filesystem does not survive a restart, and a fresh Garmin login needs an MFA
-# code typed at a terminal, so a hosted server has no way back once its tokens
-# are gone. See garmin_mcp.gcs_tokens for the accepted URI forms.
-tokens_gcs = os.getenv("GARMIN_TOKENS_GCS")
+tokenstore = token_utils.get_token_path()
+tokenstore_base64 = token_utils.get_token_base64_path()
 is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
+
+
+def _tokenstore_is_inline(value: str) -> bool:
+    """Whether the tokenstore holds token JSON rather than a filesystem path.
+
+    garminconnect treats a tokenstore longer than 512 characters as the token
+    data itself. Hosted deployments use that to inject tokens from a secret
+    store without mounting a volume.
+    """
+    return bool(value) and len(value) > 512
+
+
+def _tokenstore_display(value: str) -> str:
+    """Render a tokenstore for logs without leaking the tokens themselves.
+
+    When tokens are injected inline the value *is* the bearer credential, so
+    printing it verbatim would copy the access and refresh tokens into whatever
+    log sink the process writes to.
+    """
+    return "<inline token data>" if _tokenstore_is_inline(value) else value
 
 
 # --- Tool filtering ---------------------------------------------------------
@@ -109,20 +131,54 @@ enabled_tools = _parse_tool_set(os.getenv("GARMIN_ENABLED_TOOLS"))
 disabled_tools = _parse_tool_set(os.getenv("GARMIN_DISABLED_TOOLS"))
 
 
-# Transport selection. ``stdio`` keeps the local uvx/Claude Desktop flow
-# unchanged and stays the default; the HTTP transports are opt-in for remote
-# deployments.
-#
-# Prefer ``streamable-http`` over ``sse`` when hosting on a serverless platform.
-# SSE holds one request open for the whole client session, and platforms that
-# bill per request-second (Cloud Run among them) charge for every second that
-# request stays open — an idle connection costs the same as a busy one.
-# Stateless streamable-http answers each tool call in its own short request, so
-# nothing is billed between calls.
-_VALID_TRANSPORTS = ("stdio", "sse", "streamable-http")
+_VALID_TRANSPORTS = ("stdio", "streamable-http", "sse")
 
 
-def _env_flag(name, default):
+class _GarminProxy:
+    """Wraps the Garmin client to translate known runtime exceptions into clear messages.
+
+    Without this, token expiry or rate-limiting during a tool call surfaces raw
+    library tracebacks to the MCP client. The proxy intercepts each attribute
+    access and, if the result is callable, wraps the call so that known Garmin
+    exceptions become user-friendly strings rather than server errors.
+    """
+
+    _MESSAGES = {
+        GarminConnectAuthenticationError: (
+            "Garmin authentication expired. "
+            "Re-run 'garmin-mcp-auth' to refresh your tokens and restart the server."
+        ),
+        GarminConnectTooManyRequestsError: (
+            "Garmin rate limit hit. Wait a few minutes before retrying."
+        ),
+        GarminConnectConnectionError: (
+            "Garmin Connect is unreachable. Check your network connection or try again later."
+        ),
+    }
+
+    def __init__(self, client):
+        self._client = client
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        def _call(*args, **kwargs):
+            try:
+                return attr(*args, **kwargs)
+            except tuple(self._MESSAGES) as exc:
+                for exc_type, msg in self._MESSAGES.items():
+                    if isinstance(exc, exc_type):
+                        error_details = str(exc)
+                        full_msg = f"{msg} (Details: {error_details})" if error_details else msg
+                        raise type(exc)(full_msg) from None
+                raise
+
+        return _call
+
+
+def _env_flag(name: str, default: bool) -> bool:
     """Read a boolean env var, falling back to ``default`` when unset."""
     value = os.getenv(name)
     if value is None:
@@ -130,46 +186,36 @@ def _env_flag(name, default):
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
-def transport_settings():
-    """Resolve the transport name and FastMCP settings from the environment.
+def _parse_transport_config() -> tuple[str, dict]:
+    """Read and validate transport env vars. Raises ValueError on bad input.
 
-    Returns:
-        tuple[str, dict]: transport name for ``app.run()`` and keyword settings
-        for the ``FastMCP`` constructor (empty for stdio).
-
-    Raises:
-        ValueError: if GARMIN_MCP_TRANSPORT names an unknown transport.
+    Returns the transport name for ``app.run()`` and the settings to construct
+    ``FastMCP`` with. stdio ignores all of them.
     """
-    transport = (os.getenv("GARMIN_MCP_TRANSPORT") or "stdio").strip().lower()
+    transport = os.getenv("GARMIN_MCP_TRANSPORT", "stdio").strip().lower()
     if transport not in _VALID_TRANSPORTS:
         raise ValueError(
-            "GARMIN_MCP_TRANSPORT must be one of "
-            f"{', '.join(_VALID_TRANSPORTS)}; got {transport!r}"
+            f"Invalid GARMIN_MCP_TRANSPORT {transport!r}; "
+            f"expected one of {', '.join(_VALID_TRANSPORTS)}"
         )
 
-    if transport == "stdio":
-        return transport, {}
-
-    # PaaS platforms (Cloud Run, Render, Heroku) inject PORT; an explicit
-    # GARMIN_MCP_PORT wins when both are set.
-    platform_port = os.getenv("PORT")
-    port = os.getenv("GARMIN_MCP_PORT") or platform_port or "8000"
-
-    # A container must bind every interface or its health check cannot reach it,
-    # while a laptop should not expose an unauthenticated Garmin bridge to the
-    # local network. Presence of PORT is the usual signal for the former.
-    default_host = "0.0.0.0" if platform_port else "127.0.0.1"
-
+    # Bind to loopback by default: the HTTP transport performs no authentication,
+    # so a 0.0.0.0 default would expose full read/write access to the user's
+    # Garmin account to the whole network. Opt in explicitly with GARMIN_MCP_HOST.
     settings = {
-        "host": os.getenv("GARMIN_MCP_HOST") or default_host,
-        "port": int(port),
+        "host": os.getenv("GARMIN_MCP_HOST", "127.0.0.1"),
+        "port": int(os.getenv("GARMIN_MCP_PORT", "8000")),
     }
 
     if transport == "streamable-http":
-        # Stateless keeps no per-client session, so no connection has to persist
-        # between tool calls; JSON responses then avoid opening a stream at all.
+        # Default to stateless so no per-client session is kept and nothing has
+        # to stay connected between tool calls. This is what makes the transport
+        # cheap on platforms that bill per request-second: a session-based
+        # stream stays open — and billed — while the client sits idle, whereas
+        # a stateless call opens a request, answers, and closes in milliseconds.
         stateless = _env_flag("GARMIN_MCP_STATELESS", True)
         settings["stateless_http"] = stateless
+        # A JSON response avoids opening an event stream for a single answer.
         settings["json_response"] = _env_flag("GARMIN_MCP_JSON_RESPONSE", stateless)
 
     return transport, settings
@@ -226,14 +272,45 @@ def init_api(email, password):
     """Initialize Garmin API with your credentials."""
     import io
 
-    # Pull the tokens down first so the directory login below can find them.
-    if tokens_gcs:
-        gcs_tokens.download_tokens(tokens_gcs, tokenstore)
+    # Claude Desktop may leave blank optional user_config values as literal
+    # placeholders. Do not mistake those strings for credentials and trigger a
+    # rate-limited Garmin login from a non-interactive MCP process.
+    email = _normalize_optional_user_config(email, "garmin_email")
+    password = _normalize_optional_user_config(password, "garmin_password")
+
+    # When a GCS token store is configured it holds the freshest tokens, because
+    # that is where every instance writes its refreshes. Prefer it over the
+    # deployed GARMINTOKENS snapshot, which only ever ages.
+    token_store = None
+    effective_tokenstore = tokenstore
+    if gcs_token_store.gcs_uri():
+        try:
+            token_store = gcs_token_store.GcsTokenStore(gcs_token_store.gcs_uri())
+            stored = token_store.read()
+            if stored:
+                effective_tokenstore = stored
+                print(
+                    f"Using Garmin tokens from {token_store.uri}\n", file=sys.stderr
+                )
+            else:
+                print(
+                    f"No tokens at {token_store.uri} yet; will seed it after login.\n",
+                    file=sys.stderr,
+                )
+        except Exception as err:
+            # A broken token store must not take the server down: fall back to
+            # the deployed tokens and run without durable refreshes.
+            print(
+                f"Warning: GCS token store unavailable ({err}); "
+                "falling back to GARMINTOKENS.\n",
+                file=sys.stderr,
+            )
+            token_store = None
 
     try:
         # Using Oauth1 and OAuth2 token files from directory
         print(
-            f"Trying to login to Garmin Connect using token data from directory '{tokenstore}'...\n",
+            f"Trying to login to Garmin Connect using token data from '{_tokenstore_display(effective_tokenstore)}'...\n",
             file=sys.stderr,
         )
 
@@ -245,15 +322,20 @@ def init_api(email, password):
         # with open(dir_path, "r") as token_file:
         #     tokenstore = token_file.read()
 
-        # Suppress stderr for token validation to avoid confusing library errors
+        # Suppress stderr AND stdout during token validation.
+        # garminconnect may print progress dots (e.g. ".") to stdout; any write
+        # to stdout before the MCP server starts corrupts the JSON-RPC framing.
         old_stderr = sys.stderr
+        old_stdout = sys.stdout
         sys.stderr = io.StringIO()
+        sys.stdout = io.StringIO()
 
         try:
             garmin = Garmin(is_cn=is_cn)
-            garmin.login(tokenstore)
+            garmin.login(effective_tokenstore)
         finally:
             sys.stderr = old_stderr
+            sys.stdout = old_stdout
 
     except (FileNotFoundError, GarminConnectConnectionError, GarminConnectTooManyRequestsError, GarminConnectAuthenticationError):
         # Session is expired. You'll need to log in again
@@ -266,45 +348,84 @@ def init_api(email, password):
                 "  1. Run: garmin-mcp-auth\n"
                 "  2. Enter your credentials and MFA code\n"
                 "  3. Restart your MCP client\n"
-                f"Tokens will be saved to: {tokenstore}\n",
+                f"Tokens will be saved to: {_tokenstore_display(tokenstore)}\n",
                 file=sys.stderr,
             )
             return None
 
         print(
             "Login tokens not present, login with your Garmin Connect credentials to generate them.\n"
-            f"They will be stored in '{tokenstore}' for future use.\n",
+            f"They will be stored in '{_tokenstore_display(tokenstore)}' for future use.\n",
             file=sys.stderr,
         )
         try:
             garmin = Garmin(
                 email=email, password=password, is_cn=is_cn, prompt_mfa=get_mfa, return_on_mfa=True
             )
-            result1, result2 = garmin.login()
+            # Suppress stdout so library progress dots don't corrupt MCP framing.
+            _saved_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+            try:
+                result1, result2 = garmin.login()
+            finally:
+                sys.stdout = _saved_stdout
             if result1 == "needs_mfa":
                 mfa_code = get_mfa()
                 garmin.resume_login(result2, mfa_code)
-            # Save Oauth1 and Oauth2 token files to directory for next login
-            garmin.client.dump(tokenstore)
-            if tokens_gcs:
-                gcs_tokens.upload_tokens(tokens_gcs, tokenstore)
-            print(
-                f"Oauth tokens stored in '{tokenstore}' directory for future use. (first method)\n",
-                file=sys.stderr,
-            )
-            # Encode Oauth1 and Oauth2 tokens to base64 string and save to file for next login (alternative way)
-            expanded_tokenstore = os.path.expanduser(tokenstore)
-            token_json_path = os.path.join(expanded_tokenstore, "garmin_tokens.json")
-            with open(token_json_path, "r") as f:
-                token_data = f.read()
-            token_base64 = base64.b64encode(token_data.encode()).decode()
-            dir_path = os.path.expanduser(tokenstore_base64)
-            with open(dir_path, "w") as token_file:
-                token_file.write(token_base64)
-            print(
-                f"Oauth tokens encoded as base64 string and saved to '{dir_path}' file for future use. (second method)\n",
-                file=sys.stderr,
-            )
+
+            # return_on_mfa=True makes garminconnect's login() return as soon as
+            # it has tokens, before the profile and settings are fetched. That
+            # leaves display_name None, which every API call interpolates into a
+            # URL — so the session looks successful and then fails on every
+            # request. Re-enter login with the freshly minted tokens, which takes
+            # the cached-token branch and does run the profile-loading path.
+            if not garmin.display_name:
+                fresh_tokens = garmin.client.dumps()
+                if not _tokenstore_is_inline(fresh_tokens):
+                    raise GarminConnectAuthenticationError(
+                        "Login returned no usable token data"
+                    )
+                _saved_stdout = sys.stdout
+                sys.stdout = io.StringIO()
+                try:
+                    garmin.login(fresh_tokens)
+                finally:
+                    sys.stdout = _saved_stdout
+
+            if _tokenstore_is_inline(tokenstore):
+                # Tokens were injected from a secret store rather than a writable
+                # path, so there is nowhere to persist the new ones — and building
+                # a file path out of the token JSON would only raise. Say so
+                # instead.
+                print(
+                    "Logged in with fresh tokens. GARMINTOKENS holds inline token "
+                    "data, so they were not persisted; update the secret to avoid "
+                    "another credential login on the next start.\n",
+                    file=sys.stderr,
+                )
+            else:
+                # Save Oauth1 and Oauth2 token files to directory for next login
+                garmin.client.dump(tokenstore)
+                # Restrict the freshly written tokens to owner-only. These are
+                # ~6-month bearer credentials; the default umask would otherwise
+                # leave them world-readable on multi-user hosts.
+                token_utils.secure_token_dir(tokenstore)
+                print(
+                    f"Oauth tokens stored in '{tokenstore}' directory for future use. (first method)\n",
+                    file=sys.stderr,
+                )
+                # Encode Oauth1 and Oauth2 tokens to base64 string and save to file for next login (alternative way)
+                token_json_path = os.path.join(tokenstore, "garmin_tokens.json")
+                with open(token_json_path, "r") as f:
+                    token_data = f.read()
+                token_base64 = base64.b64encode(token_data.encode()).decode()
+                with open(tokenstore_base64, "w") as token_file:
+                    token_file.write(token_base64)
+                os.chmod(tokenstore_base64, 0o600)
+                print(
+                    f"Oauth tokens encoded as base64 string and saved to '{tokenstore_base64}' file for future use. (second method)\n",
+                    file=sys.stderr,
+                )
         except (
             FileNotFoundError,
             GarminConnectConnectionError,
@@ -350,11 +471,44 @@ def init_api(email, password):
             )
             return None
 
+    if token_store is not None:
+        # From here on, every automatic token refresh lands in GCS instead of a
+        # container filesystem that the next cold start throws away.
+        token_store.attach(garmin)
+        try:
+            # Seeds the object on first run, and after a credential login writes
+            # the new tokens straight away rather than waiting for a refresh.
+            token_store.write(garmin.client.dumps())
+        except Exception as err:
+            print(
+                f"Warning: could not write Garmin tokens to {token_store.uri}: {err}\n",
+                file=sys.stderr,
+            )
+
     return garmin
 
 
 def main():
     """Initialize the MCP server and register all tools"""
+
+    # On Windows, stdout runs in text mode and translates \n to \r\n, which
+    # breaks the MCP stdio framing that Claude Desktop and other clients expect.
+    # Force binary-transparent newlines so JSON messages arrive intact.
+    if sys.platform == "win32":
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, newline="\n")
+
+    # --- Transport configuration --------------------------------------------
+    # By default the server speaks stdio (Claude Desktop, MCP Inspector, etc.).
+    # Set GARMIN_MCP_TRANSPORT=streamable-http (or sse) to serve over HTTP.
+    #   GARMIN_MCP_TRANSPORT - stdio (default) | streamable-http | sse
+    #   GARMIN_MCP_HOST      - bind address for HTTP transports (default 127.0.0.1)
+    #   GARMIN_MCP_PORT      - bind port for HTTP transports (default 8000)
+    try:
+        transport, transport_settings = _parse_transport_config()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
 
     # Initialize Garmin client
     garmin_client = init_api(email, password)
@@ -363,6 +517,9 @@ def main():
         return
 
     print("Garmin Connect client initialized successfully.", file=sys.stderr)
+
+    # Wrap client so runtime auth/rate-limit errors surface as clear messages
+    garmin_client = _GarminProxy(garmin_client)
 
     # Configure all modules with the Garmin client
     activity_management.configure(garmin_client)
@@ -381,14 +538,10 @@ def main():
     courses.configure(garmin_client)
     activity_analysis.configure(garmin_client)
 
-    # Resolve the transport before building the app: host/port and the
-    # stateless flag are constructor settings, not run() arguments.
-    transport, settings = transport_settings()
-
-    # Create the MCP app, wrapped so the env-var filter can drop tools
-    app = _ToolFilter(
-        FastMCP("Garmin Connect v1.0", **settings), enabled_tools, disabled_tools
-    )
+    # Create the MCP app, wrapped so the env-var filter can drop tools.
+    # host/port only matter for the HTTP transports; stdio ignores them.
+    fastmcp = FastMCP("Garmin Connect v1.0", **transport_settings)
+    app = _ToolFilter(fastmcp, enabled_tools, disabled_tools)
     if enabled_tools:
         print(f"Tool filter: allowlist of {len(enabled_tools)} tool(s).", file=sys.stderr)
     elif disabled_tools:
@@ -422,19 +575,26 @@ def main():
             file=sys.stderr,
         )
 
-    # Run the MCP server
-    if transport == "stdio":
-        print("Transport: stdio", file=sys.stderr)
-    else:
+    # When serving over HTTP, expose a plain health endpoint for k8s probes.
+    # The MCP endpoint itself requires a handshake and isn't probe-friendly.
+    if transport != "stdio":
+        from starlette.requests import Request
+        from starlette.responses import PlainTextResponse
+
+        @fastmcp.custom_route("/healthz", methods=["GET"])
+        async def healthz(_request: "Request") -> "PlainTextResponse":
+            return PlainTextResponse("ok")
+
+        detail = ""
+        if transport == "streamable-http":
+            detail = f" (stateless={transport_settings['stateless_http']})"
         print(
-            f"Transport: {transport} on {settings['host']}:{settings['port']}"
-            + (
-                f" (stateless={settings['stateless_http']})"
-                if transport == "streamable-http"
-                else ""
-            ),
+            f"Serving MCP over {transport} on "
+            f"{transport_settings['host']}:{transport_settings['port']}{detail}",
             file=sys.stderr,
         )
+
+    # Run the MCP server
     app.run(transport=transport)
 
 
