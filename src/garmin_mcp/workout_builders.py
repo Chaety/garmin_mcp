@@ -261,11 +261,14 @@ def build_strength_json(
 ) -> dict:
     """Build the Garmin Connect JSON for a strength workout.
 
-    Each exercise becomes a reps-based work step. The name is preserved in the step
-    "description", which is what survives the round trip. It is also sent as
-    "exerciseName", but Garmin only retains that when it matches one of its own
-    exercise keys (e.g. "FARMERS_CARRY"); any other value is accepted and then
-    stored as an empty string.
+    Each exercise becomes a reps-based work step. When "sets" > 1 the exercise is
+    emitted as a RepeatGroupDTO iterated that many times (work + rest per set), so
+    Garmin shows the real set count — previously "sets" only ever reached the
+    description text and every exercise displayed as 1 set. The name is preserved
+    in the step "description", which is what survives the round trip. It is also
+    sent as "exerciseName", but Garmin only retains that when it matches one of
+    its own exercise keys (e.g. "FARMERS_CARRY"); any other value is accepted and
+    then stored as an empty string.
 
     "category" is optional and only emitted when the caller supplies one, uppercased
     and otherwise passed through untouched. Garmin validates it against its own enum
@@ -276,7 +279,7 @@ def build_strength_json(
     steps: List[dict] = []
     step_order = 1
 
-    for ex in exercises:
+    for index, ex in enumerate(exercises):
         ex_name = ex.get("name", "Exercise")
         sets = int(ex.get("sets", 1))
         reps = int(ex.get("reps", 1))
@@ -305,11 +308,44 @@ def build_strength_json(
                 )
             step["category"] = category.strip().upper()
 
+        if sets > 1:
+            # N sets = a repeat group iterated N times (work + rest per iteration).
+            # The explicit stepTypeId 6 / endCondition "iterations" shape matches
+            # what _sanitize_repeat_group enforces on the upload path: the Garmin
+            # API silently corrupts a RepeatGroupDTO without a valid iterations
+            # endCondition.
+            group_steps = [{**step, "stepOrder": 1}]
+            if rest_seconds > 0:
+                group_steps.append({
+                    "type": "ExecutableStepDTO",
+                    "stepOrder": 2,
+                    "stepType": {"stepTypeId": 4, "stepTypeKey": "recovery"},
+                    "description": f"Rest {rest_seconds}s",
+                    "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                    "endConditionValue": float(rest_seconds),
+                    "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"},
+                })
+            steps.append({
+                "type": "RepeatGroupDTO",
+                "stepOrder": step_order,
+                "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat"},
+                "numberOfIterations": sets,
+                "smartRepeat": False,
+                "endCondition": {"conditionTypeId": 7, "conditionTypeKey": "iterations"},
+                "workoutSteps": group_steps,
+            })
+            step_order += 1
+            # The in-group rest after the final set already separates this exercise
+            # from the next one — no extra inter-exercise rest step.
+            continue
+
         steps.append(step)
         step_order += 1
 
-        # Rest step (skip after last exercise)
-        if rest_seconds > 0 and ex != exercises[-1]:
+        # Rest step (skip after last exercise). Compared by index, not by value:
+        # two identical exercise dicts would otherwise make an earlier one look
+        # like the last and lose its rest step.
+        if rest_seconds > 0 and index != len(exercises) - 1:
             steps.append({
                 "type": "ExecutableStepDTO",
                 "stepOrder": step_order,
@@ -487,7 +523,9 @@ def register_tools(app):
     ) -> str:
         """Create a strength workout and upload it to Garmin Connect.
 
-        Each exercise becomes a reps-based step. The name is kept in the step
+        Each exercise becomes a reps-based step; when sets > 1 the exercise is
+        emitted as a repeat group of that many iterations (work + rest per set),
+        so Garmin shows the real set count. The name is kept in the step
         description; it is also sent as exerciseName, which Garmin only retains when
         it matches one of its own exercise keys (e.g. "FARMERS_CARRY").
 

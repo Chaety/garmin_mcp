@@ -12,7 +12,8 @@ dependencies = [
     "python-dotenv==1.2.2",
     "garminconnect==0.3.8",
     "requests==2.33.0",
-    # mcp 2.0 removed mcp.server.fastmcp, which this server imports.
+    # mcp 2.x renamed mcp.server.fastmcp -> mcp.server.mcpserver (FastMCP ->
+    # MCPServer). Cap until the server is ported to the new API.
     "mcp>=1.28.1,<2",
     "fitparse>=1.2.0",
 ]
@@ -25,6 +26,9 @@ gcs = [ "google-cloud-storage>=2.19",]
 [project.scripts]
 garmin-mcp = "garmin_mcp:main"
 garmin-mcp-auth = "garmin_mcp.auth_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/garmin_mcp"]
 
 [tool.uv]
 dev-dependencies = [
