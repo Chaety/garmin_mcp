@@ -13,6 +13,7 @@ from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnec
 
 # Import all modules
 from garmin_mcp import token_utils
+from garmin_mcp import gcs_token_store
 from garmin_mcp import activity_management
 from garmin_mcp import health_wellness
 from garmin_mcp import user_profile
@@ -92,6 +93,26 @@ elif password_file:
 tokenstore = token_utils.get_token_path()
 tokenstore_base64 = token_utils.get_token_base64_path()
 is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
+
+
+def _tokenstore_is_inline(value: str) -> bool:
+    """Whether the tokenstore holds token JSON rather than a filesystem path.
+
+    garminconnect treats a tokenstore longer than 512 characters as the token
+    data itself. Hosted deployments use that to inject tokens from a secret
+    store without mounting a volume.
+    """
+    return bool(value) and len(value) > 512
+
+
+def _tokenstore_display(value: str) -> str:
+    """Render a tokenstore for logs without leaking the tokens themselves.
+
+    When tokens are injected inline the value *is* the bearer credential, so
+    printing it verbatim would copy the access and refresh tokens into whatever
+    log sink the process writes to.
+    """
+    return "<inline token data>" if _tokenstore_is_inline(value) else value
 
 
 # --- Tool filtering ---------------------------------------------------------
@@ -230,10 +251,39 @@ def init_api(email, password):
     email = _normalize_optional_user_config(email, "garmin_email")
     password = _normalize_optional_user_config(password, "garmin_password")
 
+    # When a GCS token store is configured it holds the freshest tokens, because
+    # that is where every instance writes its refreshes. Prefer it over the
+    # deployed GARMINTOKENS snapshot, which only ever ages.
+    token_store = None
+    effective_tokenstore = tokenstore
+    if gcs_token_store.gcs_uri():
+        try:
+            token_store = gcs_token_store.GcsTokenStore(gcs_token_store.gcs_uri())
+            stored = token_store.read()
+            if stored:
+                effective_tokenstore = stored
+                print(
+                    f"Using Garmin tokens from {token_store.uri}\n", file=sys.stderr
+                )
+            else:
+                print(
+                    f"No tokens at {token_store.uri} yet; will seed it after login.\n",
+                    file=sys.stderr,
+                )
+        except Exception as err:
+            # A broken token store must not take the server down: fall back to
+            # the deployed tokens and run without durable refreshes.
+            print(
+                f"Warning: GCS token store unavailable ({err}); "
+                "falling back to GARMINTOKENS.\n",
+                file=sys.stderr,
+            )
+            token_store = None
+
     try:
         # Using Oauth1 and OAuth2 token files from directory
         print(
-            f"Trying to login to Garmin Connect using token data from directory '{tokenstore}'...\n",
+            f"Trying to login to Garmin Connect using token data from '{_tokenstore_display(effective_tokenstore)}'...\n",
             file=sys.stderr,
         )
 
@@ -255,7 +305,7 @@ def init_api(email, password):
 
         try:
             garmin = Garmin(is_cn=is_cn)
-            garmin.login(tokenstore)
+            garmin.login(effective_tokenstore)
         finally:
             sys.stderr = old_stderr
             sys.stdout = old_stdout
@@ -271,14 +321,14 @@ def init_api(email, password):
                 "  1. Run: garmin-mcp-auth\n"
                 "  2. Enter your credentials and MFA code\n"
                 "  3. Restart your MCP client\n"
-                f"Tokens will be saved to: {tokenstore}\n",
+                f"Tokens will be saved to: {_tokenstore_display(tokenstore)}\n",
                 file=sys.stderr,
             )
             return None
 
         print(
             "Login tokens not present, login with your Garmin Connect credentials to generate them.\n"
-            f"They will be stored in '{tokenstore}' for future use.\n",
+            f"They will be stored in '{_tokenstore_display(tokenstore)}' for future use.\n",
             file=sys.stderr,
         )
         try:
@@ -295,28 +345,60 @@ def init_api(email, password):
             if result1 == "needs_mfa":
                 mfa_code = get_mfa()
                 garmin.resume_login(result2, mfa_code)
-            # Save Oauth1 and Oauth2 token files to directory for next login
-            garmin.client.dump(tokenstore)
-            # Restrict the freshly written tokens to owner-only. These are
-            # ~6-month bearer credentials; the default umask would otherwise
-            # leave them world-readable on multi-user hosts.
-            token_utils.secure_token_dir(tokenstore)
-            print(
-                f"Oauth tokens stored in '{tokenstore}' directory for future use. (first method)\n",
-                file=sys.stderr,
-            )
-            # Encode Oauth1 and Oauth2 tokens to base64 string and save to file for next login (alternative way)
-            token_json_path = os.path.join(tokenstore, "garmin_tokens.json")
-            with open(token_json_path, "r") as f:
-                token_data = f.read()
-            token_base64 = base64.b64encode(token_data.encode()).decode()
-            with open(tokenstore_base64, "w") as token_file:
-                token_file.write(token_base64)
-            os.chmod(tokenstore_base64, 0o600)
-            print(
-                f"Oauth tokens encoded as base64 string and saved to '{tokenstore_base64}' file for future use. (second method)\n",
-                file=sys.stderr,
-            )
+
+            # return_on_mfa=True makes garminconnect's login() return as soon as
+            # it has tokens, before the profile and settings are fetched. That
+            # leaves display_name None, which every API call interpolates into a
+            # URL — so the session looks successful and then fails on every
+            # request. Re-enter login with the freshly minted tokens, which takes
+            # the cached-token branch and does run the profile-loading path.
+            if not garmin.display_name:
+                fresh_tokens = garmin.client.dumps()
+                if not _tokenstore_is_inline(fresh_tokens):
+                    raise GarminConnectAuthenticationError(
+                        "Login returned no usable token data"
+                    )
+                _saved_stdout = sys.stdout
+                sys.stdout = io.StringIO()
+                try:
+                    garmin.login(fresh_tokens)
+                finally:
+                    sys.stdout = _saved_stdout
+
+            if _tokenstore_is_inline(tokenstore):
+                # Tokens were injected from a secret store rather than a writable
+                # path, so there is nowhere to persist the new ones — and building
+                # a file path out of the token JSON would only raise. Say so
+                # instead.
+                print(
+                    "Logged in with fresh tokens. GARMINTOKENS holds inline token "
+                    "data, so they were not persisted; update the secret to avoid "
+                    "another credential login on the next start.\n",
+                    file=sys.stderr,
+                )
+            else:
+                # Save Oauth1 and Oauth2 token files to directory for next login
+                garmin.client.dump(tokenstore)
+                # Restrict the freshly written tokens to owner-only. These are
+                # ~6-month bearer credentials; the default umask would otherwise
+                # leave them world-readable on multi-user hosts.
+                token_utils.secure_token_dir(tokenstore)
+                print(
+                    f"Oauth tokens stored in '{tokenstore}' directory for future use. (first method)\n",
+                    file=sys.stderr,
+                )
+                # Encode Oauth1 and Oauth2 tokens to base64 string and save to file for next login (alternative way)
+                token_json_path = os.path.join(tokenstore, "garmin_tokens.json")
+                with open(token_json_path, "r") as f:
+                    token_data = f.read()
+                token_base64 = base64.b64encode(token_data.encode()).decode()
+                with open(tokenstore_base64, "w") as token_file:
+                    token_file.write(token_base64)
+                os.chmod(tokenstore_base64, 0o600)
+                print(
+                    f"Oauth tokens encoded as base64 string and saved to '{tokenstore_base64}' file for future use. (second method)\n",
+                    file=sys.stderr,
+                )
         except (
             FileNotFoundError,
             GarminConnectConnectionError,
@@ -361,6 +443,20 @@ def init_api(email, password):
                 file=sys.stderr,
             )
             return None
+
+    if token_store is not None:
+        # From here on, every automatic token refresh lands in GCS instead of a
+        # container filesystem that the next cold start throws away.
+        token_store.attach(garmin)
+        try:
+            # Seeds the object on first run, and after a credential login writes
+            # the new tokens straight away rather than waiting for a refresh.
+            token_store.write(garmin.client.dumps())
+        except Exception as err:
+            print(
+                f"Warning: could not write Garmin tokens to {token_store.uri}: {err}\n",
+                file=sys.stderr,
+            )
 
     return garmin
 

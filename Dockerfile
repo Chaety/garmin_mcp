@@ -16,13 +16,18 @@ ENV PYTHONUNBUFFERED=1 \
     UV_SYSTEM_PYTHON=1
 
 # Copy dependency files and README first for better layer caching
-COPY pyproject.toml README.md ./
+COPY pyproject.toml uv.lock README.md ./
 
 # Copy the application source code (needed for editable install)
 COPY src/ ./src/
 
-# Install dependencies using uv
-RUN uv pip install -e .
+# Install the exact dependency set recorded in uv.lock, then the project itself.
+# Resolving from pyproject at build time instead would let a breaking major
+# release in silently: mcp 2.0 dropped mcp.server.fastmcp, which this server
+# imports at module scope, so the container died on startup.
+RUN uv export --frozen --no-dev --no-emit-project --extra gcs --format requirements-txt > /tmp/requirements.txt && \
+    uv pip install -r /tmp/requirements.txt && \
+    uv pip install --no-deps -e .
 
 # Copy test files (optional, for testing in container)
 COPY tests/ ./tests/
