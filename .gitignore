@@ -12,6 +12,7 @@ build/
 # Virtual environments
 .env
 .venv/
+.uv-cache/
 
 # Garmin OAuth tokens and deployment env files. These are live bearer
 # credentials; keeping them out of git also keeps them out of the Docker build

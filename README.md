@@ -15,7 +15,7 @@ Garmin's API is accessed via the awesome [python-garminconnect](https://github.c
 - View body composition data
 - Track training status and readiness
 - Access cycling FTP and lactate threshold metrics
-- Manage gear and equipment
+- Manage gear and equipment, including free-text notes returned by `get_gear`
 - Access workouts and training plans
 - Inspect detailed workout step structures, including repeat groups and swim pace targets
 - Weekly health aggregates (steps, stress, intensity minutes)
@@ -28,22 +28,28 @@ Garmin's API is accessed via the awesome [python-garminconnect](https://github.c
 This MCP server implements **110+ tools** covering ~90% of the [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) library (v0.3.2):
 
 - ✅ Activity Management (20 tools) - includes write tools for type, description, event type, perceived effort, and feel
-- ✅ Health & Wellness (31 tools) - includes custom lightweight summary tools
+- ✅ Health & Wellness (33 tools) - includes custom lightweight summary tools
 - ✅ Training & Performance (13 tools) - includes CTL/ATL/TSB, HRV, VO2 max, and respiration trends
 - ✅ Workouts (8 tools)
 - ✅ Devices (7 tools)
 - ✅ Gear Management (5 tools)
 - ✅ Weight Tracking (5 tools)
 - ✅ Challenges & Badges (10 tools)
-- ✅ Nutrition (8 tools) - food logs, meals, custom foods, and food logging
+- ✅ Nutrition (9 tools) - food logs, meals, custom foods, food logging, and multi-day intake summaries
 - ✅ Women's Health (3 tools)
 - ✅ User Profile (3 tools)
 - ✅ High-Level Workout Builders (4 tools) - create and schedule workouts without writing JSON
-- ✅ Courses (3 tools) - list / upload GPX as course / delete course
+- ✅ Courses (5 tools) - list / get details / upload GPX as course / download GPX / delete course
 - ✅ Activity Analysis (2 tools) - FIT file parsing, Power Duration Curve; requires power meter and/or Di2
 - ✅ Activity File Downloads (2 tools) - download activity files in FIT, GPX, TCX, or CSV format
 
 > **Note:** Activity Analysis tools require a compatible power meter (e.g., Garmin Rally, Favero Assioma, PowerTap P1) and/or Shimano Di2 / SRAM eTap electronic shifting. The `fitparse` dependency is installed automatically.
+
+### Gear Notes
+
+Each item in the `gear` array returned by `get_gear` includes a `notes` field
+containing the free-text Notes value shown in Garmin Connect. Gear without a
+Notes value returns `null`; all existing gear fields remain unchanged.
 
 ### Activity File Downloads
 
@@ -223,6 +229,22 @@ Use ID `6` for heart rate:
   "endConditionValue": 145
 }
 ```
+
+For a zone-based heart-rate end condition, use `endConditionZone` (1-5) on the
+same `endCondition` object and omit `endConditionValue`. If both are sent,
+Garmin keeps the zone and drops the value (verified against the production API
+on 2026-09-01):
+
+```json
+{
+  "endCondition": {
+    "conditionTypeId": 6,
+    "conditionTypeKey": "heart.rate",
+    "endConditionZone": 2
+  }
+}
+```
+
 
 Common end-condition IDs:
 
@@ -405,6 +427,80 @@ For Codex and other clients, see the examples below.
 
 ---
 
+### Using more than one Garmin account
+
+A single server process is bound to one Garmin account. To use several accounts
+at once, run **one server instance per account**, each with its own token
+directory, selected with the `GARMINTOKENS` environment variable.
+
+`GARMINTOKENS` defaults to `~/.garminconnect`. Point it somewhere else and the
+server reads and writes tokens there instead, leaving the default store
+untouched.
+
+#### Step 1: Authenticate each account into its own directory
+
+```bash
+garmin-mcp-auth --token-path ~/.garminconnect-alice
+garmin-mcp-auth --token-path ~/.garminconnect-bob
+```
+
+`--token-path` also accepts `$GARMINTOKENS`, so `GARMINTOKENS=~/.garminconnect-alice garmin-mcp-auth`
+is equivalent.
+
+#### Step 2: Declare one server per account
+
+```json
+{
+  "mcpServers": {
+    "garmin-alice": {
+      "command": "uvx",
+      "args": ["--python", "3.12", "--from", "git+https://github.com/Taxuspt/garmin_mcp", "garmin-mcp"],
+      "env": {
+        "GARMINTOKENS": "${HOME}/.garminconnect-alice"
+      }
+    },
+    "garmin-bob": {
+      "command": "uvx",
+      "args": ["--python", "3.12", "--from", "git+https://github.com/Taxuspt/garmin_mcp", "garmin-mcp"],
+      "env": {
+        "GARMINTOKENS": "${HOME}/.garminconnect-bob"
+      }
+    }
+  }
+}
+```
+
+Each server logs the directory it authenticates from on startup, so you can
+confirm the wiring:
+
+```
+Trying to login to Garmin Connect using token data from directory '/home/you/.garminconnect-alice'...
+```
+
+#### Notes
+
+- **No silent fallback.** If `GARMINTOKENS` points at a directory with no valid
+  tokens, startup fails with `GarminConnectAuthenticationError` rather than
+  falling back to the default store. A misconfigured second server cannot
+  silently reuse the first account's session.
+- **`${HOME}` is expanded** even when an MCP client passes it through
+  unresolved, and `~` works on Windows via `USERPROFILE`.
+- **Restrict write tools on secondary accounts.** Tools such as
+  `upload_workout` and `schedule_workout` write to whichever account the server
+  is bound to. Pair `GARMINTOKENS` with `GARMIN_ENABLED_TOOLS` (see
+  [Tool Filtering](#tool-filtering)) to make an account read-only:
+
+  ```json
+  "env": {
+    "GARMINTOKENS": "${HOME}/.garminconnect-bob",
+    "GARMIN_ENABLED_TOOLS": "get_activities,get_activities_by_date,get_activity,get_activity_splits"
+  }
+  ```
+- **Token directories hold long-lived credentials.** They are created with
+  owner-only permissions; keep them out of shared or synced folders.
+
+---
+
 ### Development Setup
 
 1. Install the required packages on a new environment:
@@ -438,6 +534,7 @@ By default the server communicates over **stdio**, which is what Claude Desktop,
 - `GARMIN_MCP_PORT`: bind port for HTTP transports (default `8000`)
 - `GARMIN_MCP_STATELESS`: `streamable-http` only — keep no per-client session (default `true`). See [Remote deployment](#remote-deployment-http-transports) for why this matters on pay-per-second hosting.
 - `GARMIN_MCP_JSON_RESPONSE`: `streamable-http` only — answer with plain JSON rather than an event stream (default: follows `GARMIN_MCP_STATELESS`)
+- `GARMIN_MCP_CALL_TIMEOUT`: per-request timeout in seconds for calls to Garmin (default `90`). Garmin's API occasionally stalls a single request indefinitely; without this bound the call hangs until the MCP client's own timeout fires and reports the whole server as unresponsive. On timeout the tool returns a clear, retry-able error instead. Set to `0` to disable the bound.
 
 ```bash
 GARMIN_MCP_TRANSPORT=streamable-http garmin-mcp
@@ -901,6 +998,38 @@ which uvx
   }
 }
 ```
+
+### Windows: Smart App Control blocks `uv` / `uvx`
+
+On Windows 11 with **Smart App Control** enabled, `uv.exe` / `uvx.exe` may be blocked when launching Garmin_MCP — including when `uv` tries to load an unsigned `garmin-mcp.exe` from a local `.venv`.
+
+This is **not** the same as Microsoft Defender Antivirus quarantine. Smart App Control is under:
+
+**Windows Security → App & browser control → Smart App Control**
+
+#### Symptoms
+- Smart App Control notification when running `uv`, `uvx`, or Claude Desktop with `command: "uvx"`
+- Claude Desktop fails to spawn the server even though `uvx` appears installed
+- Event Viewer → *Applications and Services Logs* → *Microsoft* → *Windows* → *CodeIntegrity* → *Operational* shows **CodeIntegrity Error 3077** mentioning `uv.exe` and `garmin-mcp.exe` (policy / Enterprise signing level)
+
+#### Confirm
+1. Smart App Control is **On** (Evaluation or Enforcement).
+2. Check the CodeIntegrity Operational log for event **3077** around the failed launch.
+3. Defender “Virus & threat protection” history may be empty — that does not rule SAC out.
+
+#### Recoveries (prefer keeping Smart App Control on)
+1. Install or reinstall `uv` via a packaged channel, then verify in PowerShell:
+   ```powershell
+   winget install --id=astral-sh.uv -e
+   # or: scoop install main/uv
+   uvx --version
+   ```
+2. Point Claude Desktop at the full path to `uvx.exe` (same idea as the PATH troubleshooting above), for example:
+   ```json
+   "command": "C:\\Users\\<you>\\.local\\bin\\uvx.exe"
+   ```
+3. If Enforcement still blocks loading `garmin-mcp.exe`, you may need an admin/policy exception for that binary path. Turning Smart App Control off globally is a last resort, not the default advice.
+4. If local uvx remains blocked, use the Docker Compose install path instead.
 
 ### Login Issues
 
