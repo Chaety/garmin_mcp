@@ -880,6 +880,7 @@ Claude Desktop expect. To host it remotely, pick an HTTP transport with
 | `GARMIN_MCP_PORT` | `8000` | Bind port |
 | `GARMIN_MCP_STATELESS` | `true` | streamable-http only: keep no per-client session |
 | `GARMIN_MCP_JSON_RESPONSE` | follows `GARMIN_MCP_STATELESS` | streamable-http only: plain JSON instead of an event stream |
+| `GARMIN_MCP_API_KEY` | unset | Shared secret every HTTP request must present. See [Authenticating a published endpoint](#authenticating-a-published-endpoint) |
 
 ### Prefer `streamable-http` over `sse` when you pay per second
 
@@ -936,6 +937,72 @@ pip install 'garmin-mcp[gcs]'
 
 The service account needs `storage.objects.get` and `storage.objects.create` on
 the bucket.
+
+### Authenticating a published endpoint
+
+The MCP endpoint grants full read and write access to the Garmin account and
+authenticates nothing by itself. Bound to loopback that is fine. Published — a
+tunnel, a port forward, a NAS reachable from outside — a URL becomes the only
+thing between a stranger and the account, and the URL travels through every
+client that holds it.
+
+Set a shared secret and every HTTP request must carry it:
+
+```bash
+GARMIN_MCP_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+```
+
+Callers may present it in either header:
+
+```
+Authorization: Bearer <key>
+X-API-Key: <key>
+```
+
+In Claude's custom connector dialog, add it under **요청 헤더 / Request headers**.
+
+`GET /healthz` stays open, so container and router probes work without holding
+the key; it reports liveness and nothing else.
+
+Leave the variable unset and nothing changes — the stdio and loopback setups are
+unaffected. When an HTTP transport binds a non-loopback address without a key,
+the startup line says so in as many words.
+
+Two limits worth stating plainly. This is a shared secret, not a login: it says
+the caller holds the key, no more, and anyone it is copied to has the same
+access. And it must be paired with HTTPS — over plain HTTP the key is sent in
+clear text, so a terminating proxy (a tunnel, or the NAS's own reverse proxy
+with a certificate) belongs in front of it.
+
+### Self-hosting on a NAS or home server
+
+A machine that is already running has a real filesystem, so `GARMIN_TOKENS_GCS`
+is unnecessary — mount a volume and garminconnect's own refreshes persist. The
+repository's `docker-compose.yml` covers it:
+
+```yaml
+services:
+  garmin-mcp:
+    build: .
+    environment:
+      - GARMIN_MCP_TRANSPORT=streamable-http
+      - GARMIN_MCP_HOST=0.0.0.0
+      - GARMIN_MCP_PORT=8000
+      - GARMIN_MCP_API_KEY=${GARMIN_MCP_API_KEY}
+      - GARMINTOKENS=/root/.garminconnect
+    ports:
+      - "8000:8000"
+    volumes:
+      - garmin-tokens:/root/.garminconnect
+    restart: unless-stopped
+```
+
+Seed the token volume once from a machine where you can complete MFA (`garmin-mcp-auth`
+writes `~/.garminconnect`), then copy those files into the volume.
+
+Reaching it from Claude still needs a public HTTPS address, and the key above
+assumes one: publish through the NAS's reverse proxy with a certificate, or a
+tunnel that terminates TLS for you. Do not forward a plain HTTP port.
 
 ### Google Cloud Run
 

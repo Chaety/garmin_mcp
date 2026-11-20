@@ -15,6 +15,7 @@ from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnec
 # Import all modules
 from garmin_mcp import token_utils
 from garmin_mcp import gcs_token_store
+from garmin_mcp import http_auth
 from garmin_mcp import activity_management
 from garmin_mcp import health_wellness
 from garmin_mcp import user_profile
@@ -768,12 +769,28 @@ def main():
         async def healthz(_request: "Request") -> "PlainTextResponse":
             return PlainTextResponse("ok")
 
+        # The MCP endpoint grants full access to the Garmin account and has no
+        # authentication of its own, so anything published beyond loopback needs
+        # a key in front of it.
+        key = http_auth.api_key()
+        if key:
+            http_auth.protect(fastmcp, key)
+            auth_note = "API key required"
+        elif transport_settings["host"] in ("127.0.0.1", "localhost", "::1"):
+            auth_note = "no API key (loopback only)"
+        else:
+            auth_note = (
+                "NO API KEY — this port grants full read/write access to your "
+                "Garmin account to anyone who can reach it. Set GARMIN_MCP_API_KEY"
+            )
+
         detail = ""
         if transport == "streamable-http":
             detail = f" (stateless={transport_settings['stateless_http']})"
         print(
             f"Serving MCP over {transport} on "
-            f"{transport_settings['host']}:{transport_settings['port']}{detail}",
+            f"{transport_settings['host']}:{transport_settings['port']}{detail}; "
+            f"{auth_note}",
             file=sys.stderr,
         )
 
