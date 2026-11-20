@@ -1,42 +1,57 @@
+# Self-hosted deployment: builds the image and serves MCP over HTTP.
+#
+# Put the API key in a .env file beside this one (git ignores it):
+#
+#     GARMIN_MCP_API_KEY=<a long random string>
+#
+# Generate one with:  openssl rand -base64 32
+#
+# Seed the token volume once from a machine where MFA can be completed — see
+# "Self-hosting on a NAS or home server" in the README.
+#
+# For a local stdio client (Claude Desktop, MCP Inspector) use uvx instead:
+# this file is for hosting the server, not for running one copy per client.
+
 services:
   garmin-mcp:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: garmin-mcp-server
+    container_name: garmin-mcp
 
-    # Option 1: Use environment variables directly
     environment:
-      - GARMIN_EMAIL=${GARMIN_EMAIL}
-      - GARMIN_PASSWORD=${GARMIN_PASSWORD}
-      # - GARMIN_IS_CN=true  # Uncomment to use Garmin Connect China (garmin.cn)
+      - GARMIN_MCP_TRANSPORT=${GARMIN_MCP_TRANSPORT:-streamable-http}
+      # Bound to every interface, because otherwise the published port reaches
+      # nothing. The API key is what keeps that from meaning "open to anyone
+      # who can route here", so compose refuses to start without one.
+      - GARMIN_MCP_HOST=0.0.0.0
+      - GARMIN_MCP_PORT=8000
+      - GARMIN_MCP_API_KEY=${GARMIN_MCP_API_KEY:?set GARMIN_MCP_API_KEY in .env (openssl rand -base64 32)}
+      # The volume below is a real disk, so garminconnect's own token refreshes
+      # survive a restart and no external token store is needed.
+      - GARMINTOKENS=/root/.garminconnect
+      # - GARMIN_IS_CN=true  # Garmin Connect China (garmin.cn)
 
-    # Option 2: Use file-based secrets (uncomment to use)
-    # environment:
-    #   - GARMIN_EMAIL_FILE=/run/secrets/garmin_email
-    #   - GARMIN_PASSWORD_FILE=/run/secrets/garmin_password
-    # secrets:
-    #   - garmin_email
-    #   - garmin_password
+    ports:
+      - "${GARMIN_MCP_PUBLISH_PORT:-8000}:8000"
 
-    # Mount volume to persist Garmin OAuth tokens
     volumes:
       - garmin-tokens:/root/.garminconnect
 
-    # Restart policy
     restart: unless-stopped
 
-    # Optional: Set stdin_open and tty for interactive MFA input
-    stdin_open: true
-    tty: true
+    # /healthz takes no API key precisely so a probe can reach it.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/healthz")
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
 
 volumes:
   garmin-tokens:
     driver: local
-
-# Uncomment if using file-based secrets
-# secrets:
-#   garmin_email:
-#     file: ./secrets/garmin_email.txt
-#   garmin_password:
-#     file: ./secrets/garmin_password.txt

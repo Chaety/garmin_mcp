@@ -977,32 +977,52 @@ with a certificate) belongs in front of it.
 ### Self-hosting on a NAS or home server
 
 A machine that is already running has a real filesystem, so `GARMIN_TOKENS_GCS`
-is unnecessary — mount a volume and garminconnect's own refreshes persist. The
-repository's `docker-compose.yml` covers it:
+is unnecessary: mount a volume and garminconnect's own token refreshes persist
+across restarts.
 
-```yaml
-services:
-  garmin-mcp:
-    build: .
-    environment:
-      - GARMIN_MCP_TRANSPORT=streamable-http
-      - GARMIN_MCP_HOST=0.0.0.0
-      - GARMIN_MCP_PORT=8000
-      - GARMIN_MCP_API_KEY=${GARMIN_MCP_API_KEY}
-      - GARMINTOKENS=/root/.garminconnect
-    ports:
-      - "8000:8000"
-    volumes:
-      - garmin-tokens:/root/.garminconnect
-    restart: unless-stopped
+`docker-compose.yml` is set up for this. Clone the repository, put the key in a
+`.env` beside it, and start:
+
+```bash
+git clone https://github.com/Taxuspt/garmin_mcp.git
+cd garmin_mcp
+echo "GARMIN_MCP_API_KEY=$(openssl rand -base64 32)" > .env
+docker compose up -d --build
 ```
 
-Seed the token volume once from a machine where you can complete MFA (`garmin-mcp-auth`
-writes `~/.garminconnect`), then copy those files into the volume.
+`.env` is git-ignored, so the key never reaches a commit and `git pull` keeps
+working without conflicts. Compose refuses to start when the key is missing
+rather than coming up unauthenticated:
 
-Reaching it from Claude still needs a public HTTPS address, and the key above
-assumes one: publish through the NAS's reverse proxy with a certificate, or a
-tunnel that terminates TLS for you. Do not forward a plain HTTP port.
+```
+required variable GARMIN_MCP_API_KEY is missing a value:
+set GARMIN_MCP_API_KEY in .env (openssl rand -base64 32)
+```
+
+Publish on a different host port with `GARMIN_MCP_PUBLISH_PORT` in the same
+`.env`.
+
+#### Seeding the tokens
+
+The container cannot log in by itself — a fresh Garmin login needs an MFA code
+typed at a terminal. Authenticate once where you can do that, then copy the
+result into the volume:
+
+```bash
+garmin-mcp-auth                       # writes ~/.garminconnect
+docker compose cp ~/.garminconnect/. garmin-mcp:/root/.garminconnect/
+docker compose restart
+```
+
+From then on the server refreshes its own tokens into the volume.
+
+#### Reaching it from a client
+
+The key assumes HTTPS: over plain HTTP it is sent in clear text and anyone on
+the path can lift it. Terminate TLS in front of the container — the NAS's own
+reverse proxy with a certificate, or a tunnel that terminates for you — and
+point the client at `https://<host>/mcp`. Do not forward a plain HTTP port from
+a router.
 
 ### Google Cloud Run
 
